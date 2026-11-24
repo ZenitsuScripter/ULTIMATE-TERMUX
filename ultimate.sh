@@ -10,7 +10,7 @@ NAME="ULTIMATE"
 
 # CONFIGURACAO DO GITHUB
 REPO_USER="ZenitsuScripter"
-REPO_NAME="ULTIMATE"
+REPO_NAME="ULTIMATE-TERMUX"
 BRANCH="main"
 
 REMOTE_URL="https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/${BRANCH}/ultimate.sh"
