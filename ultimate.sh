@@ -1,11 +1,11 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
 # ==========================================
-#          ULTIMATE SYSTEM 5.0
+#          ULTIMATE SYSTEM 5.1
 #          ANDROID DEVELOPMENT
 # ==========================================
 
-VERSION="5.0.0"
+VERSION="5.1.0"
 NAME="ULTIMATE"
 
 # CONFIGURACAO DO GITHUB
@@ -326,8 +326,236 @@ projects_menu() {
 }
 
 # ==========================================
-# SISTEMA DE ATUALIZACAO
+# SISTEMA DE ATUALIZACAO INTELIGENTE
 # ==========================================
+
+# Hash do conteudo de um arquivo (detecta mudancas mesmo sem trocar a versao)
+file_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | cut -d ' ' -f1
+    elif command -v cksum >/dev/null 2>&1; then
+        cksum < "$1" 2>/dev/null | tr ' ' '-'
+    fi
+}
+
+# Le a variavel VERSION="x.y.z" de um arquivo
+file_version() {
+    grep -m1 '^VERSION=' "$1" 2>/dev/null | cut -d '"' -f2
+}
+
+# Versao valida: numeros separados por ponto (ex.: 5.1.0)
+version_valid() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+)*$ ]]
+}
+
+# Retorna 0 se $1 for maior que $2
+version_gt() {
+    [[ "$1" == "$2" ]] && return 1
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
+# Baixa e valida o arquivo remoto.
+# Sucesso: arquivo em $1 e REMOTE_VERSION preenchida.
+# Falha: retorna 1 e UPDATE_ERROR traz o motivo.
+fetch_remote() {
+    local dest="$1"
+    local timeout="${2:-10}"
+
+    UPDATE_ERROR=""
+    REMOTE_VERSION=""
+
+    if ! command -v curl >/dev/null 2>&1; then
+        UPDATE_ERROR="Curl nao encontrado. Instale com: pkg install curl"
+        return 1
+    fi
+
+    if ! curl -fsSL --connect-timeout "$timeout" --max-time 60 \
+        -H "Cache-Control: no-cache" \
+        "${REMOTE_URL}?nocache=$(date +%s)" -o "$dest" 2>/dev/null; then
+        UPDATE_ERROR="Nao foi possivel acessar o GitHub. Verifique a conexao."
+        rm -f "$dest"
+        return 1
+    fi
+
+    if [[ ! -s "$dest" ]]; then
+        UPDATE_ERROR="O arquivo remoto veio vazio."
+        rm -f "$dest"
+        return 1
+    fi
+
+    if ! bash -n "$dest" 2>/dev/null; then
+        UPDATE_ERROR="O arquivo remoto possui erro de sintaxe (bash -n)."
+        rm -f "$dest"
+        return 1
+    fi
+
+    REMOTE_VERSION="$(file_version "$dest")"
+
+    if ! version_valid "$REMOTE_VERSION" || ! grep -q 'main_menu' "$dest"; then
+        UPDATE_ERROR="O arquivo remoto nao parece ser um ULTIMATE valido."
+        REMOTE_VERSION=""
+        rm -f "$dest"
+        return 1
+    fi
+
+    return 0
+}
+
+# Substitui o arquivo instalado com backup e rollback automatico.
+# $1 = arquivo novo ja validado
+apply_update() {
+    local new="$1"
+    local stage="$INSTALL_FILE.new.$$"
+    local old_version
+    old_version="$(file_version "$INSTALL_FILE")"
+    [[ -z "$old_version" ]] && old_version="$VERSION"
+
+    BACKUP_FILE="$BACKUP_DIR/ultimate-${old_version}-$(date +%Y%m%d-%H%M%S).sh"
+
+    mkdir -p "$BACKUP_DIR" 2>/dev/null
+
+    # 1) Backup da versao atual
+    if ! cp -p "$INSTALL_FILE" "$BACKUP_FILE" 2>/dev/null || [[ ! -s "$BACKUP_FILE" ]]; then
+        UPDATE_ERROR="Nao foi possivel criar o backup. Nada foi alterado."
+        rm -f "$BACKUP_FILE"
+        BACKUP_FILE=""
+        return 1
+    fi
+
+    # 2) Prepara o arquivo novo ao lado do instalado (mesmo disco = troca atomica)
+    if ! cp "$new" "$stage" 2>/dev/null; then
+        UPDATE_ERROR="Nao foi possivel preparar o novo arquivo. Instalacao atual preservada."
+        rm -f "$stage"
+        return 1
+    fi
+
+    # 3) Permissao de execucao e revalidacao antes de trocar
+    chmod +x "$stage" 2>/dev/null
+
+    if ! bash -n "$stage" 2>/dev/null; then
+        UPDATE_ERROR="Falha na validacao final (bash -n). Instalacao atual preservada."
+        rm -f "$stage"
+        return 1
+    fi
+
+    # 4) Troca atomica
+    if ! mv -f "$stage" "$INSTALL_FILE" 2>/dev/null; then
+        UPDATE_ERROR="Nao foi possivel substituir o arquivo. Instalacao atual preservada."
+        rm -f "$stage"
+        if [[ ! -s "$INSTALL_FILE" ]]; then
+            cp -p "$BACKUP_FILE" "$INSTALL_FILE" 2>/dev/null
+        fi
+        chmod +x "$INSTALL_FILE" 2>/dev/null
+        return 1
+    fi
+
+    chmod +x "$INSTALL_FILE" 2>/dev/null
+
+    # 5) Confere o resultado; se estiver errado, volta o backup
+    if [[ "$(file_hash "$INSTALL_FILE")" != "$(file_hash "$new")" ]] || ! bash -n "$INSTALL_FILE" 2>/dev/null; then
+        UPDATE_ERROR="A verificacao pos-instalacao falhou. Backup restaurado."
+        cp -p "$BACKUP_FILE" "$stage" 2>/dev/null &&
+            chmod +x "$stage" 2>/dev/null &&
+            mv -f "$stage" "$INSTALL_FILE" 2>/dev/null
+        rm -f "$stage"
+        chmod +x "$INSTALL_FILE" 2>/dev/null
+        return 1
+    fi
+
+    return 0
+}
+
+# Fluxo completo.
+# $1 = manual (menu/comando) ou auto (checagem ao abrir)
+# Retorna 0 normalmente e 2 quando a atualizacao foi instalada.
+smart_update() {
+    local mode="${1:-manual}"
+    local timeout=10
+    local tmp="$HOME_ULT/update.$$.tmp"
+    local local_hash remote_hash local_version reason resposta
+
+    [[ "$mode" == "auto" ]] && timeout=5
+
+    if [[ ! -f "$INSTALL_FILE" ]]; then
+        if [[ "$mode" == "manual" ]]; then
+            echo -e "${R}ULTIMATE nao esta instalado.${N}"
+            echo "Instale com: bash ultimate.sh install"
+        fi
+        return 0
+    fi
+
+    if ! fetch_remote "$tmp" "$timeout"; then
+        if [[ "$mode" == "manual" ]]; then
+            echo -e "${R}${UPDATE_ERROR}${N}"
+        fi
+        rm -f "$tmp"
+        return 0
+    fi
+
+    local_hash="$(file_hash "$INSTALL_FILE")"
+    remote_hash="$(file_hash "$tmp")"
+
+    local_version="$(file_version "$INSTALL_FILE")"
+    [[ -z "$local_version" ]] && local_version="$VERSION"
+
+    if [[ "$mode" == "manual" ]]; then
+        echo ""
+        echo -e "${D}Versao local:  ${local_version}${N}"
+        echo -e "${D}Versao remota: ${REMOTE_VERSION}${N}"
+        echo ""
+    fi
+
+    # Decide se existe atualizacao
+    if version_gt "$REMOTE_VERSION" "$local_version"; then
+        reason="version"
+    elif [[ "$REMOTE_VERSION" == "$local_version" && -n "$local_hash" && "$local_hash" != "$remote_hash" ]]; then
+        reason="content"
+    else
+        if [[ "$mode" == "manual" ]]; then
+            if version_gt "$local_version" "$REMOTE_VERSION"; then
+                echo -e "${G}Sua versao local e mais recente que a do GitHub. Nenhuma atualizacao necessaria.${N}"
+            else
+                echo -e "${G}ULTIMATE ja esta atualizado!${N}"
+            fi
+        fi
+        rm -f "$tmp"
+        return 0
+    fi
+
+    echo ""
+
+    if [[ "$reason" == "version" ]]; then
+        echo -e "${Y}Nova versao disponivel: $REMOTE_VERSION (atual: $local_version)${N}"
+    else
+        echo -e "${Y}Atualizacao disponivel: o codigo no GitHub mudou (versao $local_version).${N}"
+    fi
+
+    read -rp "Deseja atualizar? (s/n): " resposta
+
+    if [[ ! "$resposta" =~ ^[Ss]$ ]]; then
+        echo "Atualizacao cancelada."
+        rm -f "$tmp"
+        return 0
+    fi
+
+    if apply_update "$tmp"; then
+        rm -f "$tmp"
+        echo ""
+        echo -e "${G}Atualizacao concluida com sucesso!${N}"
+        echo -e "${D}Backup salvo em: $BACKUP_FILE${N}"
+        echo "Reinicie o ULTIMATE para carregar a nova versao."
+        return 2
+    fi
+
+    rm -f "$tmp"
+    echo ""
+    echo -e "${R}ERRO: ${UPDATE_ERROR}${N}"
+
+    # No modo auto a tela e limpa logo depois, entao espera o usuario ler
+    [[ "$mode" == "auto" ]] && pause
+
+    return 0
+}
 
 update_system() {
 
@@ -337,70 +565,11 @@ update_system() {
 
     echo -e "${C}VERIFICANDO ATUALIZACOES...${N}"
 
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "Curl não encontrado."
-        pause
-        return
-    fi
+    smart_update manual
+    rc=$?
 
-    TMP="$HOME_ULT/update.tmp"
-
-    if ! curl -fsSL --connect-timeout 10 "$REMOTE_URL" -o "$TMP"; then
-        echo -e "${R}Nao foi possivel acessar o GitHub.${N}"
-        rm -f "$TMP"
-        pause
-        return
-    fi
-
-    if ! bash -n "$TMP"; then
-        echo -e "${R}Arquivo remoto possui erro de sintaxe.${N}"
-        rm -f "$TMP"
-        pause
-        return
-    fi
-
-    NEW_VERSION=$(grep -m1 '^VERSION=' "$TMP" | cut -d '"' -f2)
-
-    if [[ -z "$NEW_VERSION" ]]; then
-        echo -e "${R}Versao remota invalida.${N}"
-        rm -f "$TMP"
-        pause
-        return
-    fi
-
-    if [[ "$NEW_VERSION" == "$VERSION" ]]; then
-        echo -e "${G}ULTIMATE ja esta atualizado!${N}"
-        rm -f "$TMP"
-        pause
-        return
-    fi
-
-    echo -e "${Y}Nova versao encontrada: $NEW_VERSION${N}"
-
-    read -rp "Deseja atualizar? (s/n): " resposta
-
-    if [[ "$resposta" =~ ^[Ss]$ ]]; then
-
-        cp "$INSTALL_FILE" "$BACKUP_DIR/ultimate-$VERSION.sh" 2>/dev/null
-
-        cp "$TMP" "$INSTALL_FILE"
-
-        chmod +x "$INSTALL_FILE"
-
-        rm -f "$TMP"
-
-        echo -e "${G}Atualizacao concluida!${N}"
-
-        echo "Reinicie o menu para carregar a nova versao."
-
+    if [[ $rc -eq 2 ]]; then
         exit 0
-
-    else
-
-        rm -f "$TMP"
-
-        echo "Atualizacao cancelada."
-
     fi
 
     pause
@@ -412,42 +581,11 @@ update_system() {
 
 check_update() {
 
-    if ! command -v curl >/dev/null 2>&1; then
-        return
+    smart_update auto
+
+    if [[ $? -eq 2 ]]; then
+        exit 0
     fi
-
-    TMP="$HOME_ULT/check.tmp"
-
-    if curl -fsSL --connect-timeout 5 "$REMOTE_URL" -o "$TMP" 2>/dev/null; then
-
-        REMOTE_VERSION=$(grep -m1 '^VERSION=' "$TMP" | cut -d '"' -f2)
-
-        if [[ -n "$REMOTE_VERSION" && "$REMOTE_VERSION" != "$VERSION" ]]; then
-
-            echo ""
-            echo -e "${Y}Nova versão disponível: $REMOTE_VERSION${N}"
-
-            read -rp "Atualizar agora? (s/n): " resposta
-
-            if [[ "$resposta" =~ ^[Ss]$ ]]; then
-
-                cp "$INSTALL_FILE" "$BACKUP_DIR/ultimate-$VERSION.sh" 2>/dev/null
-
-                if bash -n "$TMP"; then
-                    cp "$TMP" "$INSTALL_FILE"
-                    chmod +x "$INSTALL_FILE"
-                    echo -e "${G}Atualizado! Reinicie o ULTIMATE.${N}"
-                    rm -f "$TMP"
-                    exit 0
-                fi
-
-            fi
-
-        fi
-
-    fi
-
-    rm -f "$TMP"
 }
 
 # ==========================================
